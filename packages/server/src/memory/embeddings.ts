@@ -1,4 +1,5 @@
 import { Ollama } from "ollama";
+import { spawn } from "node:child_process";
 
 const MODEL = "nomic-embed-text";
 
@@ -27,15 +28,22 @@ export function isUsingFallback(): boolean {
   return _fallbackMode === true;
 }
 
+// Probe Ollama with a 2s timeout to avoid hanging hooks.
+async function probe(): Promise<boolean> {
+  const client = getClient();
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("Ollama timeout")), 2000),
+  );
+  const models = await Promise.race([client.list(), timeout]);
+  return models.models.some((m) => m.name.startsWith(MODEL));
+}
+
 async function ensureOllama(): Promise<boolean> {
   if (_fallbackMode === true) return false;
   if (_fallbackMode === false) return true;
 
-  // First check — determine if Ollama is available
   try {
-    const client = getClient();
-    const models = await client.list();
-    const hasModel = models.models.some((m) => m.name.startsWith(MODEL));
+    const hasModel = await probe();
     if (!hasModel) {
       _fallbackMode = true;
       logFallbackWarning();
@@ -44,6 +52,24 @@ async function ensureOllama(): Promise<boolean> {
     _fallbackMode = false;
     return true;
   } catch {
+    // Not reachable — try to auto-start Ollama, then retry once.
+    try {
+      spawn("ollama", ["serve"], { detached: true, stdio: "ignore" }).unref();
+    } catch {
+      // ollama not on PATH — skip auto-start
+    }
+    await new Promise<void>((r) => setTimeout(r, 2500));
+
+    try {
+      const hasModel = await probe();
+      if (hasModel) {
+        _fallbackMode = false;
+        return true;
+      }
+    } catch {
+      // still not up after auto-start attempt
+    }
+
     _fallbackMode = true;
     logFallbackWarning();
     return false;
@@ -94,7 +120,10 @@ export function bufferToEmbedding(buffer: Buffer): Float32Array {
 export async function checkOllama(): Promise<{ ok: boolean; error?: string }> {
   try {
     const client = getClient();
-    const models = await client.list();
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Ollama timeout")), 5000),
+    );
+    const models = await Promise.race([client.list(), timeout]);
     const hasModel = models.models.some((m) => m.name.startsWith(MODEL));
     if (!hasModel) {
       return {
@@ -103,7 +132,10 @@ export async function checkOllama(): Promise<{ ok: boolean; error?: string }> {
       };
     }
     return { ok: true };
-  } catch {
+  } catch (e: any) {
+    if (e?.message === "Ollama timeout") {
+      return { ok: false, error: "Ollama timed out — is it responding?" };
+    }
     return {
       ok: false,
       error: `Ollama not reachable. Is it running? Try: ollama serve`,
