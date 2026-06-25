@@ -11,7 +11,11 @@ import { getDb, generateId, closeDb } from "../memory/db.js";
 import { embed, embeddingToBuffer } from "../memory/embeddings.js";
 
 const HOME = os.homedir();
-const debug = (msg: string) => process.stderr.write(`[index-new] ${msg}\n`);
+const DEBUG_LOG = path.join(HOME, ".soul", "data", "index-debug.log");
+const debug = (msg: string) => {
+  const line = `[${new Date().toISOString()}] [index-new] ${msg}\n`;
+  try { fs.appendFileSync(DEBUG_LOG, line); } catch { /* non-fatal */ }
+};
 
 async function indexNewJournals(): Promise<number> {
   const dir = path.join(HOME, ".soul", "journals");
