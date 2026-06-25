@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 // Lightweight indexer for Stop hook — only indexes new journals and lessons.
-// Runs silently in <3s. Exits 0 on any error (hooks must be resilient).
+// Embeds all pending entries in parallel so the hook completes quickly even
+// when a large backlog has accumulated. Exits 0 on any error (hooks must be resilient).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { getDb, generateId, closeDb } from "../memory/db.js";
 import { embed, embeddingToBuffer } from "../memory/embeddings.js";
 
 const HOME = os.homedir();
+const debug = (msg: string) => process.stderr.write(`[index-new] ${msg}\n`);
 
 async function indexNewJournals(): Promise<number> {
   const dir = path.join(HOME, ".soul", "journals");
@@ -17,7 +19,9 @@ async function indexNewJournals(): Promise<number> {
 
   const db = getDb();
   const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-  let count = 0;
+
+  type PendingEntry = { entryContent: string; project: string | null; created: number };
+  const pending: PendingEntry[] = [];
 
   for (const file of files) {
     const filePath = path.join(dir, file);
@@ -40,17 +44,33 @@ async function indexNewJournals(): Promise<number> {
       const dateMatch = file.match(/(\d{4}-\d{2}-\d{2})/);
       const created = dateMatch ? new Date(dateMatch[1]).getTime() : Date.now();
 
-      const embedding = await embed(entryContent.slice(0, 2000));
-
-      db.prepare(
-        `INSERT INTO journal_entries (id, session_id, project, content, created_at, embedding)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(generateId("jrn"), null, project, entryContent, created, embedding ? embeddingToBuffer(embedding) : null);
-      count++;
+      pending.push({ entryContent, project, created });
     }
   }
 
-  return count;
+  if (pending.length === 0) return 0;
+
+  debug(`embedding ${pending.length} journal entries in parallel...`);
+  const embeddings = await Promise.all(
+    pending.map((p) => embed(p.entryContent.slice(0, 2000))),
+  );
+
+  for (let i = 0; i < pending.length; i++) {
+    const { entryContent, project, created } = pending[i];
+    db.prepare(
+      `INSERT INTO journal_entries (id, session_id, project, content, created_at, embedding)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      generateId("jrn"),
+      null,
+      project,
+      entryContent,
+      created,
+      embeddings[i] ? embeddingToBuffer(embeddings[i]!) : null,
+    );
+  }
+
+  return pending.length;
 }
 
 async function indexNewLessons(): Promise<number> {
@@ -65,7 +85,8 @@ async function indexNewLessons(): Promise<number> {
     confidence: number;
   }>;
 
-  let count = 0;
+  type PendingLesson = { id: string; content: string };
+  const pending: PendingLesson[] = [];
 
   for (const lesson of data) {
     const content = `${lesson.lesson}\nContext: ${lesson.context}`;
@@ -75,9 +96,17 @@ async function indexNewLessons(): Promise<number> {
       .get(`lesson:${lesson.id}`) as { id: string } | undefined;
     if (existing) continue;
 
-    const embedding = await embed(content);
-    const now = Date.now();
+    pending.push({ id: lesson.id, content });
+  }
 
+  if (pending.length === 0) return 0;
+
+  debug(`embedding ${pending.length} lessons in parallel...`);
+  const embeddings = await Promise.all(pending.map((p) => embed(p.content)));
+
+  const now = Date.now();
+  for (let i = 0; i < pending.length; i++) {
+    const { id, content } = pending[i];
     db.prepare(
       `INSERT INTO memories (id, content, category, project, source_file, created_at, updated_at, accessed_at, embedding)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -86,25 +115,30 @@ async function indexNewLessons(): Promise<number> {
       content,
       "lesson",
       null,
-      `lesson:${lesson.id}`,
+      `lesson:${id}`,
       now,
       now,
       now,
-      embedding ? embeddingToBuffer(embedding) : null,
+      embeddings[i] ? embeddingToBuffer(embeddings[i]!) : null,
     );
-    count++;
   }
 
-  return count;
+  return pending.length;
 }
 
 async function main() {
+  const start = Date.now();
+  debug("starting");
+
   const journals = await indexNewJournals();
   const lessons = await indexNewLessons();
 
+  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+  debug(`done in ${elapsed}s — ${journals} journal(s), ${lessons} lesson(s)`);
+
   if (journals + lessons > 0) {
     const logPath = path.join(HOME, ".soul", "data", "index-log.txt");
-    const msg = `[${new Date().toISOString()}] Auto-indexed: ${journals} journal(s), ${lessons} lesson(s)\n`;
+    const msg = `[${new Date().toISOString()}] Auto-indexed: ${journals} journal(s), ${lessons} lesson(s) in ${elapsed}s\n`;
     fs.appendFileSync(logPath, msg);
   }
 }
