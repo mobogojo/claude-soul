@@ -1,14 +1,27 @@
 #!/usr/bin/env node
 
 // Lightweight indexer for Stop hook — only indexes new journals and lessons.
-// Embeds all pending entries in parallel so the hook completes quickly even
-// when a large backlog has accumulated. Exits 0 on any error (hooks must be resilient).
+// Runs as fire-and-forget: when invoked as a hook it immediately spawns a
+// detached background worker and exits, so Claude Code is never blocked on
+// Ollama embed calls. The worker does the actual indexing.
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { getDb, generateId, closeDb } from "../memory/db.js";
 import { embed, embeddingToBuffer } from "../memory/embeddings.js";
+
+// If not running as the background worker, spawn ourselves detached and exit.
+if (!process.env.SOUL_INDEX_WORKER) {
+  spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, SOUL_INDEX_WORKER: "1" },
+  }).unref();
+  process.exit(0);
+}
 
 const HOME = os.homedir();
 const DEBUG_LOG = path.join(HOME, ".soul", "data", "index-debug.log");
