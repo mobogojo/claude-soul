@@ -75,6 +75,7 @@ export async function callClaude(
     const result = await new Promise<string>((resolve, reject) => {
       const proc = spawn(resolveClaudeBin(), args, {
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
         env: { ...process.env, NO_COLOR: "1" },
       });
 
