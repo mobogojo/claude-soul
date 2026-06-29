@@ -178,6 +178,7 @@ async function main() {
       spawn(process.execPath, [workerPath, tier], {
         detached: true,
         stdio: "ignore",
+        windowsHide: true,
       }).unref();
     }
   } catch (err) {

@@ -54,7 +54,7 @@ async function ensureOllama(): Promise<boolean> {
   } catch {
     // Not reachable — try to auto-start Ollama, then retry once.
     try {
-      spawn("ollama", ["serve"], { detached: true, stdio: "ignore" }).unref();
+      spawn("ollama", ["serve"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
     } catch {
       // ollama not on PATH — skip auto-start
     }

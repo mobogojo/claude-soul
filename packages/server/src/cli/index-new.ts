@@ -18,6 +18,7 @@ if (!process.env.SOUL_INDEX_WORKER) {
   spawn(process.execPath, [fileURLToPath(import.meta.url)], {
     detached: true,
     stdio: "ignore",
+    windowsHide: true,
     env: { ...process.env, SOUL_INDEX_WORKER: "1" },
   }).unref();
   process.exit(0);
