@@ -7,6 +7,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { writeFileAtomic } from "../util/atomic-write.js";
+import { resolveBashCommand } from "../util/bash.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,6 +20,8 @@ const HOOKS_DIR = path.join(SOUL_DIR, "hooks");
 // Forward-slash version of HOOKS_DIR for shell commands — bash on Windows
 // (Git Bash, the one Claude Code invokes) cannot resolve backslash paths.
 const HOOKS_DIR_FWD = HOOKS_DIR.replace(/\\/g, "/");
+// `bash` on POSIX; an absolute Git Bash path on Windows (see util/bash.ts).
+const BASH = resolveBashCommand();
 const JOURNALS_DIR = path.join(SOUL_DIR, "journals");
 const REFLECTIONS_DIR = path.join(SOUL_DIR, "reflections");
 const SNAPSHOTS_DIR = path.join(DATA_DIR, "snapshots");
@@ -102,7 +105,7 @@ function buildSoulHooksConfig() {
       matcher: "",
       hooks: [
         { type: "command", command: findOnStopCommand(), timeout: 15000 },
-        { type: "command", command: `bash ${quotePath(HOOKS_DIR_FWD + "/session-journal.sh")}`, timeout: 3000 },
+        { type: "command", command: `${BASH} ${quotePath(HOOKS_DIR_FWD + "/session-journal.sh")}`, timeout: 3000 },
         { type: "command", command: `node ${quotePath(HOOKS_DIR_FWD + "/session-agency.js")}`, timeout: 10000 },
         { type: "command", command: findIndexNewCommand(), timeout: 10000 },
         { type: "command", command: findCorrectionExtractorCommand(), timeout: 5000 },
@@ -113,7 +116,7 @@ function buildSoulHooksConfig() {
     {
       matcher: "",
       hooks: [
-        { type: "command", command: `bash ${quotePath(HOOKS_DIR_FWD + "/session-scratchpad.sh")}`, timeout: 2000 },
+        { type: "command", command: `${BASH} ${quotePath(HOOKS_DIR_FWD + "/session-scratchpad.sh")}`, timeout: 2000 },
       ],
     },
   ],
@@ -121,7 +124,7 @@ function buildSoulHooksConfig() {
     {
       matcher: "Write|Edit",
       hooks: [
-        { type: "command", command: `bash ${quotePath(HOOKS_DIR_FWD + "/write-guard.sh")}`, timeout: 2000 },
+        { type: "command", command: `${BASH} ${quotePath(HOOKS_DIR_FWD + "/write-guard.sh")}`, timeout: 2000 },
       ],
     },
   ],
