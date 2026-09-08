@@ -10,7 +10,16 @@
  * Input (stdin): JSON with session_id, transcript_path, cwd
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  closeSync,
+  fstatSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -166,11 +175,43 @@ function appendCriticalFindings(findings, sessionId) {
 
 // --- Main ---
 
+/** Last N bytes only — transcripts can exceed V8's max string (~512MB). */
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+
+function readFileTail(path, maxBytes = TRANSCRIPT_TAIL_BYTES) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const { size } = fstatSync(fd);
+    if (size <= 0) return "";
+    const start = size > maxBytes ? size - maxBytes : 0;
+    const length = size - start;
+    const buf = Buffer.allocUnsafe(length);
+    const bytesRead = readSync(fd, buf, 0, length, start);
+    let text = buf.toString("utf8", 0, bytesRead);
+    // Drop a partial first line if we landed mid-record.
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      if (nl !== -1) text = text.slice(nl + 1);
+    }
+    return text;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 function parseTranscript(transcriptPath) {
   if (!existsSync(transcriptPath)) return "";
 
-  const raw = readFileSync(transcriptPath, "utf-8");
-  const tail = raw.slice(-20000);
+  const tail = readFileTail(transcriptPath);
   const lines = [];
 
   for (const line of tail.split("\n")) {
