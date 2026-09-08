@@ -18,7 +18,16 @@ import { selectTopLessons } from "./lesson-store.js";
 import { FrameworkEngine } from "./framework-engine.js";
 import type { SoulConfig } from "../types/config-types.js";
 
-function renderFrameworkVocabulary(store: FrameworkStore): string {
+/**
+ * Note that `total - shown` entries were dropped, so a truncated list never
+ * reads as the complete set.
+ */
+function overflowNote(total: number, shown: number): string[] {
+  if (total <= shown) return [];
+  return [`- …and ${total - shown} more, omitted to stay within the context budget`];
+}
+
+function renderFrameworkVocabulary(store: FrameworkStore, maxEntries: number): string {
   const models = store.frameworks
     .filter((f) => (f.status === "active" || f.status === "questioning") && f.kind !== "process")
     .sort((a, b) => b.confidence - a.confidence);
@@ -31,15 +40,17 @@ function renderFrameworkVocabulary(store: FrameworkStore): string {
   lines.push("Named concepts available as thinking vocabulary. Apply when relevant:");
   lines.push("");
 
-  for (const fw of models) {
+  // Sorted by confidence, so the cap keeps the strongest.
+  for (const fw of models.slice(0, maxEntries)) {
     const tier = fw.evidenceTier ?? "hypothesis";
     lines.push(`- **${fw.name}** [${tier}]: ${fw.description.slice(0, 150)}`);
   }
+  lines.push(...overflowNote(models.length, maxEntries));
 
   return lines.join("\n");
 }
 
-function renderProcessFrameworks(store: FrameworkStore): string {
+function renderProcessFrameworks(store: FrameworkStore, maxEntries: number): string {
   const processes = store.frameworks
     .filter((f) => (f.status === "active" || f.status === "questioning") && f.kind === "process")
     .sort((a, b) => b.confidence - a.confidence);
@@ -52,11 +63,12 @@ function renderProcessFrameworks(store: FrameworkStore): string {
   lines.push("Procedures to follow when triggered. Check triggers against current task:");
   lines.push("");
 
-  for (const fw of processes) {
+  for (const fw of processes.slice(0, maxEntries)) {
     const tier = fw.evidenceTier ?? "hypothesis";
     const triggers = (fw.triggers ?? []).join(" | ");
     lines.push(`- **${fw.name}** [${tier}]: ${triggers}`);
   }
+  lines.push(...overflowNote(processes.length, maxEntries));
 
   return lines.join("\n");
 }
@@ -113,15 +125,17 @@ export async function assembleSoulContext(config: SoulConfig): Promise<string> {
   // and re-prime the same Recent Patterns warnings on every session start.
   const recentSignals = await readUnconsumed("quick");
 
+  const maxFrameworkEntries = config.contextBudget.maxFrameworkEntries;
+
   const blocks: ContentBlock[] = [];
 
   // --- TIER 1: Always included ---
-  const frameworkVocabulary = renderFrameworkVocabulary(store);
+  const frameworkVocabulary = renderFrameworkVocabulary(store, maxFrameworkEntries);
   if (frameworkVocabulary.trim()) {
     blocks.push({ content: frameworkVocabulary, tier: 1, label: "Framework Vocabulary" });
   }
 
-  const processFrameworks = renderProcessFrameworks(store);
+  const processFrameworks = renderProcessFrameworks(store, maxFrameworkEntries);
   if (processFrameworks.trim()) {
     blocks.push({ content: processFrameworks, tier: 1, label: "Cognitive Processes" });
   }
@@ -203,7 +217,7 @@ export async function assembleSoulContext(config: SoulConfig): Promise<string> {
     blocks.push({ content: storyMd, tier: 3, label: "STORY.md" });
   }
 
-  return applyTokenBudget(blocks, config.contextBudget.maxTokens);
+  return applyTokenBudget(blocks, config.contextBudget.maxTokens, config.contextBudget.maxBytes);
 }
 
 export async function assembleSlimContext(): Promise<string> {

@@ -73,8 +73,35 @@ export async function readFileSafe(filePath: string): Promise<string> {
   }
 }
 
+/**
+ * Merge a stored config over the defaults, one level into each section.
+ *
+ * Configs are written once at install and then left alone, so a config on
+ * disk is generally older than the code reading it and will be missing any
+ * field added since. Returning it verbatim makes every new setting `undefined`
+ * on existing installs -- silently skipping whatever it guards. Defaults fill
+ * only the gaps; anything the user set wins.
+ */
+export function mergeConfig(stored: unknown, defaults: SoulConfig): SoulConfig {
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+
+  const merged = { ...defaults } as Record<string, unknown>;
+  for (const [key, value] of Object.entries(stored as Record<string, unknown>)) {
+    if (value === undefined) continue;
+    const base = (defaults as Record<string, unknown>)[key];
+    const bothPlainObjects =
+      base && typeof base === "object" && !Array.isArray(base) &&
+      value && typeof value === "object" && !Array.isArray(value);
+    merged[key] = bothPlainObjects
+      ? { ...(base as object), ...(value as object) }
+      : value;
+  }
+  return merged as SoulConfig;
+}
+
 export async function loadConfig(): Promise<SoulConfig> {
-  return readJsonSafe<SoulConfig>(CONFIG_PATH, DEFAULT_CONFIG);
+  const stored = await readJsonSafe<unknown>(CONFIG_PATH, null);
+  return mergeConfig(stored, DEFAULT_CONFIG);
 }
 
 export function soulFilePath(name: string): string {
