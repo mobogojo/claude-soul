@@ -306,6 +306,14 @@ BENIGN = [
     "Authorization: Bearer",
     "the deploy token was rotated last week",
     "run tests with pytest -q and check coverage",
+    # "AUTH" inside a word: these matched before the boundary fix and would
+    # have redacted the trailer of every commit message in the transcript.
+    "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+    "author: Logan Waggoner",
+    # Templates and placeholders are not credentials.
+    "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}",
+    "API_KEY=<your-key-here>",
+    "SECRET_TOKEN=$MY_ENV_VAR",
 ]
 
 
@@ -314,6 +322,14 @@ def test_benign_content_is_untouched(text):
     out, found = ct.redact_text(text)
     assert out == text, f"over-redacted: {found}"
     assert not found
+
+
+def test_bearer_scheme_word_survives_but_the_token_does_not():
+    text = "Authorization: Bearer " + tok("eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiJ4In0.abcdefghij")
+    out, found = ct.redact_text(text)
+    assert "Bearer" in out, "redacted the scheme word instead of the token"
+    assert ct.REDACTED in out
+    assert found
 
 
 def test_high_entropy_blob_needs_secret_context():

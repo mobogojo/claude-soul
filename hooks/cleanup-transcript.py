@@ -69,7 +69,10 @@ REDACTED = "xxxx-REDACTED-xxxx"
 
 _SECRET_WORD = (
     r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY"
-    r"|CREDENTIAL|CONNECTION[_-]?STRING|AUTH|BEARER|SESSION[_-]?KEY|CLIENT[_-]?SECRET)"
+    # AUTH must not run into more letters, or "Co-Authored-By" and "author"
+    # match and the commit trailer gets redacted.
+    r"|CREDENTIAL|CONNECTION[_-]?STRING|AUTH(?![A-Za-z])|BEARER"
+    r"|SESSION[_-]?KEY|CLIENT[_-]?SECRET)"
 )
 
 # NAME=value / NAME: value — the env-dump case.
@@ -157,7 +160,12 @@ def redact_text(text: str) -> tuple[str, dict[str, int]]:
         # "Authorization: Bearer <jwt>" would otherwise redact the word Bearer
         # and leave the token to a later pattern. Scheme words and placeholders
         # are not secrets; skipping them keeps the transcript readable.
-        if value.lower() in _NOT_SECRET_VALUES or REDACTED in value:
+        if (
+            value.lower() in _NOT_SECRET_VALUES
+            or REDACTED in value
+            # Docs and templates, not credentials: <your-token>, ${VAR}, YOUR_KEY.
+            or value.startswith(("<", "{", "$", "%", "your", "YOUR", "***", "xxx"))
+        ):
             return m.group(0)
         bump("env-assignment")
         # Keep the key so the transcript still reads sensibly.
