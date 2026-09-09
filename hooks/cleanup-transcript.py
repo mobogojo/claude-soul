@@ -45,12 +45,6 @@ DEFAULT_INTERVAL_DAYS = 14
 # session. Claude Code appends on every turn, so idle-for-30-minutes is a
 # conservative stand-in for "nobody is writing to this".
 DEFAULT_ACTIVE_GRACE_MIN = 30
-# Scanning runs ~3 MB/s, so cap how much any one invocation reads. The first
-# sweep of a large backlog spreads over several runs instead of blowing the
-# hook timeout; afterwards each run only sees newly appended bytes.
-DEFAULT_SCAN_BUDGET_MB = 12
-# Above this, rewriting is slow enough to wait for an idle session.
-LIVE_REWRITE_MAX_BYTES = 25 * 1024 * 1024
 STATE_FILE = Path.home() / ".soul" / "data" / "transcript-cleanup.json"
 IMAGE_PLACEHOLDER = "[image removed by transcript cleanup]"
 TOOL_PLACEHOLDER = "[trimmed by transcript cleanup: tool result older than keep-days]"
@@ -282,7 +276,15 @@ def stub_tool_results(obj: dict) -> None:
         obj["toolUseResult"] = TOOL_PLACEHOLDER
 
 
-def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
+def process_file(path: Path, cutoff: datetime, dry_run: bool, redact: bool = True) -> dict:
+    """Rewrite the transcript: strip images, stub old tool results, redact secrets.
+
+    Redaction rides along with this pass rather than running separately. It used
+    to be its own scan on every Stop hook, which cost ~2 minutes per turn across
+    a large backlog. Cleanup already streams and rewrites the whole file, so
+    folding redaction in makes it effectively free -- at the cost of secrets
+    waiting for the size or interval trigger. Use --redact-only to run it now.
+    """
     stats = {
         "in_bytes": path.stat().st_size,
         "out_bytes": 0,
@@ -293,6 +295,7 @@ def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
         "stripped_images": 0,
         "stubbed_tools": 0,
         "user_kept": 0,
+        "redacted": {},
         "replaced": False,
     }
     tmp_path = path.with_name(path.name + ".cleanup-tmp")
@@ -314,6 +317,23 @@ def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
                     stats["out_lines"] += 1
                     continue
 
+                # Redaction applies to every record regardless of age; a secret
+                # does not become safe because it is old.
+                redacted = False
+                if redact:
+                    obj, hits = redact_obj(obj)
+                    if hits:
+                        redacted = True
+                        for k, v in hits.items():
+                            stats["redacted"][k] = stats["redacted"].get(k, 0) + v
+
+                def emit(changed: bool) -> None:
+                    if changed or redacted:
+                        out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+                        dst.write(out.encode("utf-8"))
+                    else:
+                        dst.write(raw if raw.endswith(b"\n") else raw + b"\n")
+
                 kind = obj.get("type")
                 if kind == "file-history-snapshot":
                     ts = parse_ts((obj.get("snapshot") or {}).get("timestamp"))
@@ -321,7 +341,7 @@ def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
                         stats["dropped_snapshots"] += 1
                         continue
                     stats["kept_snapshots"] += 1
-                    dst.write(raw if raw.endswith(b"\n") else raw + b"\n")
+                    emit(False)
                     stats["out_lines"] += 1
                     continue
 
@@ -340,15 +360,11 @@ def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
                         stub_tool_results(obj)
                         stats["stubbed_tools"] += 1
                         changed = True
-                    if changed:
-                        out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-                        dst.write(out.encode("utf-8"))
-                    else:
-                        dst.write(raw if raw.endswith(b"\n") else raw + b"\n")
+                    emit(changed)
                     stats["out_lines"] += 1
                     continue
 
-                dst.write(raw if raw.endswith(b"\n") else raw + b"\n")
+                emit(False)
                 stats["out_lines"] += 1
 
         stats["out_bytes"] = tmp_path.stat().st_size if tmp_path.exists() else 0
@@ -388,41 +404,6 @@ def safe_replace(tmp_path: Path, path: Path, expected: tuple[int, int]) -> bool:
         # Windows can refuse the rename while another process holds the file.
         tmp_path.unlink(missing_ok=True)
         return False
-
-
-def scan_for_secrets(path: Path, start: int, budget: int) -> tuple[dict[str, int], int]:
-    """Detection pass over appended bytes. Returns (hits, offset reached).
-
-    Two bounds keep this off the critical path. Transcripts only grow, so after
-    the first sweep each run sees only the new tail; and `budget` caps how much
-    any single run reads, because this executes inside a hook with a timeout.
-    Scanning is roughly 3 MB/s, so an unbounded first pass over a few hundred MB
-    exceeds the timeout, gets killed before it can record progress, and repeats
-    that cost on every invocation forever. Progress is saved by the caller after
-    each file, so a partial sweep still moves forward.
-    """
-    found: dict[str, int] = {}
-    reached = start
-    try:
-        # Binary, with the offset tracked by hand: tell() is disabled while
-        # iterating a text file, and counting characters would drift from the
-        # byte offset on any non-ASCII line.
-        with path.open("rb") as fh:
-            if start:
-                fh.seek(start)
-                reached = start + len(fh.readline())  # align to a line boundary
-            used = 0
-            for raw in fh:
-                _, counts = redact_text(raw.decode("utf-8", "replace"))
-                for k, v in counts.items():
-                    found[k] = found.get(k, 0) + v
-                reached += len(raw)
-                used += len(raw)
-                if used >= budget:
-                    break
-    except OSError:
-        return {}, start
-    return found, reached
 
 
 def redact_file(path: Path, dry_run: bool) -> dict:
@@ -491,19 +472,6 @@ def last_run_at(state: dict, path: Path) -> datetime | None:
     return parse_ts(entry.get("last_run"))
 
 
-def mark_redact_offset(state: dict, path: Path, offset: int, pending: bool = False) -> None:
-    """Record scan progress, and persist it immediately.
-
-    Persisting here rather than at exit matters: this runs inside a hook with a
-    timeout, and if the process is killed before writing state it re-scans the
-    same bytes on every invocation forever -- slow, and never finishing.
-    """
-    entry = state.setdefault("files", {}).setdefault(file_key(path), {})
-    entry["redact_offset"] = offset
-    entry["redact_pending"] = pending
-    save_state(state)
-
-
 def mark_ran(state: dict, path: Path, bytes_after: int) -> None:
     files = state.setdefault("files", {})
     # Update in place: replacing the entry would drop redact_offset and send
@@ -542,6 +510,14 @@ def print_stats(path: Path, stats: dict) -> None:
         f"old_tools={stats['stubbed_tools']} replaced={stats['replaced']}",
         file=sys.stderr,
     )
+    if stats.get("redacted"):
+        kinds = ", ".join(f"{k}={v}" for k, v in sorted(stats["redacted"].items()))
+        print(f"  redacted secrets — {kinds}", file=sys.stderr)
+        print(
+            "  These were already sent to the API before this ran. Redaction stops "
+            "them being re-read; rotate them.",
+            file=sys.stderr,
+        )
 
 
 def read_hook_path() -> Path | None:
@@ -610,12 +586,6 @@ def main() -> int:
         "--no-redact", action="store_true", help="Skip the secret-redaction pass"
     )
     parser.add_argument(
-        "--scan-budget-mb",
-        type=int,
-        default=DEFAULT_SCAN_BUDGET_MB,
-        help="Max MB of transcript the secret scan reads per invocation (0 = unlimited)",
-    )
-    parser.add_argument(
         "--redact-only",
         action="store_true",
         help="Redact secrets and skip size/interval trimming entirely",
@@ -634,7 +604,10 @@ def main() -> int:
 
     # Stdin names the session that triggered this run. It is the one file that
     # is guaranteed to be open, so it marks what to skip -- not what to clean.
-    live = read_hook_path()
+    # Skip reading it entirely when a path was named on the command line: the
+    # read blocks until stdin closes, which never happens in an interactive
+    # shell, and an explicitly named target does not need the hint anyway.
+    live = None if args.path else read_hook_path()
 
     paths: list[Path] = []
     if args.path:
@@ -646,57 +619,31 @@ def main() -> int:
         return 0
 
     now = datetime.now(timezone.utc)
-    scan_budget = (args.scan_budget_mb * 1024 * 1024) or float("inf")
 
     for path in paths:
         if not path.is_file():
             continue
 
-        # Redaction runs on every invocation, including on a live session --
-        # a secret is re-read on every resume, so it should not wait for the
-        # size or interval trigger. safe_replace makes that safe.
-        if not args.no_redact and scan_budget > 0:
-            entry = state.get("files", {}).get(file_key(path), {})
-            offset = int(entry.get("redact_offset", 0))
-            pending = bool(entry.get("redact_pending", False))
-            size_now = path.stat().st_size
-            if size_now < offset:
-                offset = 0  # file shrank (trimmed elsewhere) -- rescan in full
-
-            found, reached = scan_for_secrets(path, offset, scan_budget)
-            scan_budget -= max(0, reached - offset)
-            pending = pending or bool(found)
-
-            # Rewriting a very large file is itself slow, so keep it off the
-            # hook's critical path unless the session is idle. A pending flag
-            # carries the finding forward until then.
-            idle = active_reason(path, live, now, args.active_grace_min) is None
-            if pending and (idle or size_now <= LIVE_REWRITE_MAX_BYTES):
-                stats = redact_file(path, dry_run=args.dry_run)
-                if stats["found"]:
-                    kinds = ", ".join(f"{k}={v}" for k, v in sorted(stats["found"].items()))
-                    verb = "would redact" if args.dry_run else (
-                        "redacted" if stats["replaced"] else "redaction deferred (file changed)"
-                    )
-                    print(f"{path}: {verb} — {kinds}", file=sys.stderr)
-                    print(
-                        "  These credentials were already sent to the API before this ran. "
-                        "Redaction stops them being re-read; rotate them.",
-                        file=sys.stderr,
-                    )
-                if not args.dry_run and stats["replaced"]:
-                    reached = path.stat().st_size
-                    pending = False
-            elif pending and found:
+        if args.redact_only:
+            # Explicit, on-demand pass: redact without waiting for the size or
+            # interval trigger. Not part of the Stop hook's normal work.
+            if not args.allow_active:
+                blocked = active_reason(path, live, now, args.active_grace_min)
+                if blocked:
+                    print(f"{path}: skipped ({blocked})", file=sys.stderr)
+                    continue
+            stats = redact_file(path, dry_run=args.dry_run)
+            if stats["found"]:
+                kinds = ", ".join(f"{k}={v}" for k, v in sorted(stats["found"].items()))
+                verb = "would redact" if args.dry_run else (
+                    "redacted" if stats["replaced"] else "deferred (file changed mid-write)"
+                )
+                print(f"{path}: {verb} — {kinds}", file=sys.stderr)
                 print(
-                    f"{path}: secrets found; rewrite deferred until the session is idle",
+                    "  These credentials were already sent to the API before this ran. "
+                    "Redaction stops them being re-read; rotate them.",
                     file=sys.stderr,
                 )
-
-            if not args.dry_run:
-                mark_redact_offset(state, path, reached, pending)
-
-        if args.redact_only:
             continue
 
         if not args.allow_active:

@@ -410,60 +410,99 @@ def test_safe_replace_commits_when_unchanged(tmp_path):
     assert ct.safe_replace(tmp, target, (st.st_size, st.st_mtime_ns)) is True
     assert target.read_text(encoding="utf-8") == "redacted\n"
 
+# --------------------------------------------------------------------------
+# Redaction runs as part of the cleanup rewrite
+#
+# It used to be a separate scan on every Stop hook, which cost ~2 minutes per
+# turn across a large backlog. Cleanup already streams and rewrites the whole
+# file, so redaction rides along with it instead.
+# --------------------------------------------------------------------------
 
-def test_scan_only_reads_new_bytes(tmp_path):
+def _write(tmp_path, records):
     src = tmp_path / "t.jsonl"
-    src.write_text(
-        "GITHUB_TOKEN=" + tok("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8") + "\n",
-        encoding="utf-8",
-    )
-    found, reached = ct.scan_for_secrets(src, 0, 10 * 1024 * 1024)
-    assert found
-    assert reached > 0
-    # Second pass starts where the first finished, so it re-reads nothing.
-    again, _ = ct.scan_for_secrets(src, src.stat().st_size, 10 * 1024 * 1024)
-    assert not again
+    src.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return src
 
 
-def test_scan_budget_bounds_a_single_run(tmp_path):
-    """The regression that made every Stop hook take two minutes.
+def test_cleanup_redacts_secrets_in_the_same_pass(tmp_path):
+    src = _write(tmp_path, [{
+        "type": "user",
+        "timestamp": (NOW - timedelta(days=1)).isoformat(),
+        "message": {"content": [
+            {"type": "text", "text": "GITHUB_TOKEN=" + tok("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")}
+        ]},
+    }])
 
-    Scanning runs ~3 MB/s. Without a per-run cap the first sweep over a large
-    backlog exceeded the hook timeout, was killed before it could record
-    progress, and repeated the same cost on the next turn forever.
-    """
-    src = tmp_path / "big.jsonl"
-    src.write_text(("x" * 4096 + "\n") * 400, encoding="utf-8")  # ~1.6 MB
-    _, reached = ct.scan_for_secrets(src, 0, 64 * 1024)
-    assert reached < src.stat().st_size, "budget did not stop the scan"
-    assert reached > 0, "budget made no progress at all"
+    stats = ct.process_file(src, cutoff=NOW - timedelta(days=14), dry_run=False)
 
-
-def test_scan_resumes_from_where_the_budget_stopped(tmp_path):
-    src = tmp_path / "big.jsonl"
-    src.write_text(("y" * 4096 + "\n") * 200, encoding="utf-8")
-    _, first = ct.scan_for_secrets(src, 0, 64 * 1024)
-    _, second = ct.scan_for_secrets(src, first, 64 * 1024)
-    assert second > first, "second run did not advance past the first"
+    body = src.read_text(encoding="utf-8")
+    assert stats["redacted"], "cleanup did not redact"
+    assert "ghp_" not in body
+    assert ct.REDACTED in body
 
 
-def test_offset_is_persisted_immediately(tmp_path, monkeypatch):
-    """A hook killed at its timeout must not lose scan progress."""
-    state_file = tmp_path / "state.json"
-    monkeypatch.setattr(ct, "STATE_FILE", state_file)
-    state = {}
-    ct.mark_redact_offset(state, tmp_path / "t.jsonl", 4096)
-    assert state_file.is_file(), "offset was not written to disk"
-    assert json.loads(state_file.read_text(encoding="utf-8"))["files"]
+def test_redaction_applies_regardless_of_record_age(tmp_path):
+    """A secret does not become safe because the record is old or new."""
+    src = _write(tmp_path, [
+        {"type": "user", "timestamp": (NOW - timedelta(days=90)).isoformat(),
+         "message": {"content": [{"type": "text", "text": "OLD_API_KEY=abcdef123456ghijkl"}]}},
+        {"type": "user", "timestamp": NOW.isoformat(),
+         "message": {"content": [{"type": "text", "text": "NEW_API_KEY=zyxwvu987654tsrqpo"}]}},
+    ])
+
+    ct.process_file(src, cutoff=NOW - timedelta(days=14), dry_run=False)
+
+    body = src.read_text(encoding="utf-8")
+    assert "abcdef123456ghijkl" not in body
+    assert "zyxwvu987654tsrqpo" not in body
+    assert body.count(ct.REDACTED) == 2
 
 
-def test_mark_ran_preserves_the_redact_offset(tmp_path, monkeypatch):
-    """mark_ran replaced the whole entry, sending the scan back to byte zero."""
-    monkeypatch.setattr(ct, "STATE_FILE", tmp_path / "state.json")
-    target = tmp_path / "t.jsonl"
-    state = {}
-    ct.mark_redact_offset(state, target, 12345)
-    ct.mark_ran(state, target, 999)
-    entry = state["files"][ct.file_key(target)]
-    assert entry["redact_offset"] == 12345
-    assert entry["bytes_after"] == 999
+def test_redaction_can_be_turned_off(tmp_path):
+    src = _write(tmp_path, [{
+        "type": "user", "timestamp": NOW.isoformat(),
+        "message": {"content": [{"type": "text", "text": "API_KEY=abcdef123456ghijkl"}]},
+    }])
+
+    ct.process_file(src, cutoff=NOW - timedelta(days=14), dry_run=False, redact=False)
+
+    assert "abcdef123456ghijkl" in src.read_text(encoding="utf-8")
+
+
+def test_redaction_in_cleanup_keeps_tool_pairing(tmp_path):
+    """Redacting mid-cleanup must not disturb the message array's integrity."""
+    old = (NOW - timedelta(days=60)).isoformat()
+    src = _write(tmp_path, [
+        {"type": "assistant", "timestamp": old,
+         "message": {"content": [{"type": "tool_use", "id": "toolu_5", "name": "Bash"}]}},
+        {"type": "user", "timestamp": old,
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_5",
+                                  "content": "DISCORD_TOKEN=abcdef123456ghijklmnop"}]}},
+    ])
+
+    ct.process_file(src, cutoff=NOW, dry_run=False)
+
+    uses, results = set(), set()
+    for line in src.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        for block in json.loads(line).get("message", {}).get("content", []):
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use":
+                    uses.add(block["id"])
+                if block.get("type") == "tool_result":
+                    results.add(block["tool_use_id"])
+    assert uses == results == {"toolu_5"}
+
+
+def test_cleanup_leaves_a_clean_transcript_byte_identical(tmp_path):
+    """No secrets and nothing old: the rewrite must not churn the file."""
+    src = _write(tmp_path, [{
+        "type": "user", "timestamp": NOW.isoformat(),
+        "message": {"content": [{"type": "text", "text": "just an ordinary message"}]},
+    }])
+    before = src.read_text(encoding="utf-8")
+
+    ct.process_file(src, cutoff=NOW - timedelta(days=14), dry_run=False)
+
+    assert src.read_text(encoding="utf-8") == before
