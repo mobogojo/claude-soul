@@ -417,5 +417,53 @@ def test_scan_only_reads_new_bytes(tmp_path):
         "GITHUB_TOKEN=" + tok("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8") + "\n",
         encoding="utf-8",
     )
-    assert ct.scan_for_secrets(src, 0)
-    assert not ct.scan_for_secrets(src, src.stat().st_size)
+    found, reached = ct.scan_for_secrets(src, 0, 10 * 1024 * 1024)
+    assert found
+    assert reached > 0
+    # Second pass starts where the first finished, so it re-reads nothing.
+    again, _ = ct.scan_for_secrets(src, src.stat().st_size, 10 * 1024 * 1024)
+    assert not again
+
+
+def test_scan_budget_bounds_a_single_run(tmp_path):
+    """The regression that made every Stop hook take two minutes.
+
+    Scanning runs ~3 MB/s. Without a per-run cap the first sweep over a large
+    backlog exceeded the hook timeout, was killed before it could record
+    progress, and repeated the same cost on the next turn forever.
+    """
+    src = tmp_path / "big.jsonl"
+    src.write_text(("x" * 4096 + "\n") * 400, encoding="utf-8")  # ~1.6 MB
+    _, reached = ct.scan_for_secrets(src, 0, 64 * 1024)
+    assert reached < src.stat().st_size, "budget did not stop the scan"
+    assert reached > 0, "budget made no progress at all"
+
+
+def test_scan_resumes_from_where_the_budget_stopped(tmp_path):
+    src = tmp_path / "big.jsonl"
+    src.write_text(("y" * 4096 + "\n") * 200, encoding="utf-8")
+    _, first = ct.scan_for_secrets(src, 0, 64 * 1024)
+    _, second = ct.scan_for_secrets(src, first, 64 * 1024)
+    assert second > first, "second run did not advance past the first"
+
+
+def test_offset_is_persisted_immediately(tmp_path, monkeypatch):
+    """A hook killed at its timeout must not lose scan progress."""
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(ct, "STATE_FILE", state_file)
+    state = {}
+    ct.mark_redact_offset(state, tmp_path / "t.jsonl", 4096)
+    assert state_file.is_file(), "offset was not written to disk"
+    assert json.loads(state_file.read_text(encoding="utf-8"))["files"]
+
+
+def test_mark_ran_preserves_the_redact_offset(tmp_path, monkeypatch):
+    """mark_ran replaced the whole entry, sending the scan back to byte zero."""
+    monkeypatch.setattr(ct, "STATE_FILE", tmp_path / "state.json")
+    target = tmp_path / "t.jsonl"
+    state = {}
+    ct.mark_redact_offset(state, target, 12345)
+    ct.mark_ran(state, target, 999)
+    entry = state["files"][ct.file_key(target)]
+    assert entry["redact_offset"] == 12345
+    assert entry["bytes_after"] == 999

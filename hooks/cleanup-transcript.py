@@ -45,6 +45,12 @@ DEFAULT_INTERVAL_DAYS = 14
 # session. Claude Code appends on every turn, so idle-for-30-minutes is a
 # conservative stand-in for "nobody is writing to this".
 DEFAULT_ACTIVE_GRACE_MIN = 30
+# Scanning runs ~3 MB/s, so cap how much any one invocation reads. The first
+# sweep of a large backlog spreads over several runs instead of blowing the
+# hook timeout; afterwards each run only sees newly appended bytes.
+DEFAULT_SCAN_BUDGET_MB = 12
+# Above this, rewriting is slow enough to wait for an idle session.
+LIVE_REWRITE_MAX_BYTES = 25 * 1024 * 1024
 STATE_FILE = Path.home() / ".soul" / "data" / "transcript-cleanup.json"
 IMAGE_PLACEHOLDER = "[image removed by transcript cleanup]"
 TOOL_PLACEHOLDER = "[trimmed by transcript cleanup: tool result older than keep-days]"
@@ -129,6 +135,13 @@ def _redact_high_entropy(text: str, bump) -> str:
     Entropy alone cannot tell an API key from a commit SHA, so the surrounding
     text has to vouch for it.
     """
+    # A hit requires a secret-ish word before the blob, so if the text has none
+    # there is nothing to find. Checking that first avoids computing entropy for
+    # every long run in every line -- transcripts are full of base64 and hashes,
+    # and that scan was costing ~2 minutes per Stop hook across all transcripts.
+    if not SECRET_CONTEXT_RE.search(text):
+        return text
+
     out: list[str] = []
     last = 0
     for m in HIGH_ENTROPY_RE.finditer(text):
@@ -148,8 +161,21 @@ def _redact_high_entropy(text: str, bump) -> str:
     return "".join(out)
 
 
+# Cheap literal pre-check. Every rule below needs one of these substrings, so a
+# line without any cannot produce a hit and can be skipped before the expensive
+# passes run. Most transcript lines are ordinary output and exit here.
+PREFILTER_RE = re.compile(
+    r"(?i)secret|token|password|passwd|api[_-]?key|access[_-]?key|private[\s_-]?key"
+    r"|credential|connection[_-]?string|auth|bearer|session[_-]?key|client[_-]?secret"
+    r"|AKIA|gh[pousr]_|github_pat_|xox|[sr]k_(?:live|test)_|AIza|sk-|eyJ|://[^/\s\"']+:"
+)
+
+
 def redact_text(text: str) -> tuple[str, dict[str, int]]:
     """Return the text with secrets replaced, plus a count by kind."""
+    if not PREFILTER_RE.search(text):
+        return text, {}
+
     found: dict[str, int] = {}
 
     def bump(kind: str) -> None:
@@ -364,26 +390,39 @@ def safe_replace(tmp_path: Path, path: Path, expected: tuple[int, int]) -> bool:
         return False
 
 
-def scan_for_secrets(path: Path, start: int) -> dict[str, int]:
-    """Cheap detection pass over bytes appended since the last scan.
+def scan_for_secrets(path: Path, start: int, budget: int) -> tuple[dict[str, int], int]:
+    """Detection pass over appended bytes. Returns (hits, offset reached).
 
-    Transcripts only grow, so rescanning from zero on every Stop would mean
-    re-reading hundreds of MB to find nothing. Scan the new tail; a full
-    rewrite only happens when this finds something.
+    Two bounds keep this off the critical path. Transcripts only grow, so after
+    the first sweep each run sees only the new tail; and `budget` caps how much
+    any single run reads, because this executes inside a hook with a timeout.
+    Scanning is roughly 3 MB/s, so an unbounded first pass over a few hundred MB
+    exceeds the timeout, gets killed before it can record progress, and repeats
+    that cost on every invocation forever. Progress is saved by the caller after
+    each file, so a partial sweep still moves forward.
     """
     found: dict[str, int] = {}
+    reached = start
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
+        # Binary, with the offset tracked by hand: tell() is disabled while
+        # iterating a text file, and counting characters would drift from the
+        # byte offset on any non-ASCII line.
+        with path.open("rb") as fh:
             if start:
                 fh.seek(start)
-                fh.readline()  # align to a line boundary
-            for line in fh:
-                _, counts = redact_text(line)
+                reached = start + len(fh.readline())  # align to a line boundary
+            used = 0
+            for raw in fh:
+                _, counts = redact_text(raw.decode("utf-8", "replace"))
                 for k, v in counts.items():
                     found[k] = found.get(k, 0) + v
+                reached += len(raw)
+                used += len(raw)
+                if used >= budget:
+                    break
     except OSError:
-        return {}
-    return found
+        return {}, start
+    return found, reached
 
 
 def redact_file(path: Path, dry_run: bool) -> dict:
@@ -452,18 +491,26 @@ def last_run_at(state: dict, path: Path) -> datetime | None:
     return parse_ts(entry.get("last_run"))
 
 
-def mark_redact_offset(state: dict, path: Path, offset: int) -> None:
-    """Remember how far the secret scan has read, so it only sees new bytes."""
+def mark_redact_offset(state: dict, path: Path, offset: int, pending: bool = False) -> None:
+    """Record scan progress, and persist it immediately.
+
+    Persisting here rather than at exit matters: this runs inside a hook with a
+    timeout, and if the process is killed before writing state it re-scans the
+    same bytes on every invocation forever -- slow, and never finishing.
+    """
     entry = state.setdefault("files", {}).setdefault(file_key(path), {})
     entry["redact_offset"] = offset
+    entry["redact_pending"] = pending
+    save_state(state)
 
 
 def mark_ran(state: dict, path: Path, bytes_after: int) -> None:
     files = state.setdefault("files", {})
-    files[file_key(path)] = {
-        "last_run": datetime.now(timezone.utc).isoformat(),
-        "bytes_after": bytes_after,
-    }
+    # Update in place: replacing the entry would drop redact_offset and send
+    # the secret scan back to byte zero.
+    entry = files.setdefault(file_key(path), {})
+    entry["last_run"] = datetime.now(timezone.utc).isoformat()
+    entry["bytes_after"] = bytes_after
     save_state(state)
 
 
@@ -563,6 +610,12 @@ def main() -> int:
         "--no-redact", action="store_true", help="Skip the secret-redaction pass"
     )
     parser.add_argument(
+        "--scan-budget-mb",
+        type=int,
+        default=DEFAULT_SCAN_BUDGET_MB,
+        help="Max MB of transcript the secret scan reads per invocation (0 = unlimited)",
+    )
+    parser.add_argument(
         "--redact-only",
         action="store_true",
         help="Redact secrets and skip size/interval trimming entirely",
@@ -593,6 +646,7 @@ def main() -> int:
         return 0
 
     now = datetime.now(timezone.utc)
+    scan_budget = (args.scan_budget_mb * 1024 * 1024) or float("inf")
 
     for path in paths:
         if not path.is_file():
@@ -601,13 +655,23 @@ def main() -> int:
         # Redaction runs on every invocation, including on a live session --
         # a secret is re-read on every resume, so it should not wait for the
         # size or interval trigger. safe_replace makes that safe.
-        if not args.no_redact:
-            key = file_key(path)
-            offset = int(state.get("files", {}).get(key, {}).get("redact_offset", 0))
+        if not args.no_redact and scan_budget > 0:
+            entry = state.get("files", {}).get(file_key(path), {})
+            offset = int(entry.get("redact_offset", 0))
+            pending = bool(entry.get("redact_pending", False))
             size_now = path.stat().st_size
             if size_now < offset:
                 offset = 0  # file shrank (trimmed elsewhere) -- rescan in full
-            if scan_for_secrets(path, offset):
+
+            found, reached = scan_for_secrets(path, offset, scan_budget)
+            scan_budget -= max(0, reached - offset)
+            pending = pending or bool(found)
+
+            # Rewriting a very large file is itself slow, so keep it off the
+            # hook's critical path unless the session is idle. A pending flag
+            # carries the finding forward until then.
+            idle = active_reason(path, live, now, args.active_grace_min) is None
+            if pending and (idle or size_now <= LIVE_REWRITE_MAX_BYTES):
                 stats = redact_file(path, dry_run=args.dry_run)
                 if stats["found"]:
                     kinds = ", ".join(f"{k}={v}" for k, v in sorted(stats["found"].items()))
@@ -621,9 +685,16 @@ def main() -> int:
                         file=sys.stderr,
                     )
                 if not args.dry_run and stats["replaced"]:
-                    size_now = path.stat().st_size
+                    reached = path.stat().st_size
+                    pending = False
+            elif pending and found:
+                print(
+                    f"{path}: secrets found; rewrite deferred until the session is idle",
+                    file=sys.stderr,
+                )
+
             if not args.dry_run:
-                mark_redact_offset(state, path, size_now)
+                mark_redact_offset(state, path, reached, pending)
 
         if args.redact_only:
             continue
