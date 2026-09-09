@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,6 +48,160 @@ DEFAULT_ACTIVE_GRACE_MIN = 30
 STATE_FILE = Path.home() / ".soul" / "data" / "transcript-cleanup.json"
 IMAGE_PLACEHOLDER = "[image removed by transcript cleanup]"
 TOOL_PLACEHOLDER = "[trimmed by transcript cleanup: tool result older than keep-days]"
+REDACTED = "xxxx-REDACTED-xxxx"
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+#
+# Printing an env dump into a session puts live credentials into the transcript,
+# where they are read again on every --resume and by anything that indexes the
+# file. Redaction removes that ongoing exposure. It does NOT undo the original
+# exposure -- the value was already sent to the API when it entered context --
+# so a hit here still means rotate.
+#
+# Two tiers, because over-redaction quietly destroys the transcript:
+#   1. Shapes that are secrets by construction (AKIA…, ghp_…, PEM blocks).
+#      Always redacted.
+#   2. High-entropy blobs, which look identical to git SHAs, checksums, base64
+#      payloads and minified JS. Only redacted when a secret-ish word appears
+#      just before them.
+# ---------------------------------------------------------------------------
+
+_SECRET_WORD = (
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY"
+    r"|CREDENTIAL|CONNECTION[_-]?STRING|AUTH|BEARER|SESSION[_-]?KEY|CLIENT[_-]?SECRET)"
+)
+
+# NAME=value / NAME: value — the env-dump case.
+ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Z0-9_.\-]*" + _SECRET_WORD + r"[A-Z0-9_.\-]*)"  # 1: key (kept)
+    r"(\s*[=:]\s*)"                                              # 2: separator
+    r"([\"']?)"                                                  # 3: optional quote
+    r"([^\s\"'`,;]{6,})"                                         # 4: value (dropped)
+    r"\3"
+)
+
+# (name, pattern, group to replace; 0 = whole match)
+SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]", int]] = [
+    ("pem-private-key",
+     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), 0),
+    ("aws-access-key-id", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),
+    ("github-token",
+     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})"), 0),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"), 0),
+    ("stripe-key", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"), 0),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), 0),
+    ("anthropic-openai-key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_\-]{20,}"), 0),
+    ("jwt",
+     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}"), 0),
+    # user:password@host — replace only the password group.
+    ("url-credentials", re.compile(r"(://[^/\s:@\"']+:)([^/\s:@\"']{4,})(@)"), 2),
+]
+
+# Values that match the assignment shape but carry no secret.
+_NOT_SECRET_VALUES = {
+    "bearer", "basic", "digest", "none", "null", "true", "false", "undefined",
+    "changeme", "password", "secret", "redacted", "xxxxx", "example",
+}
+
+HIGH_ENTROPY_RE = re.compile(r"[A-Za-z0-9+/_\-]{32,}={0,2}")
+SECRET_CONTEXT_RE = re.compile(r"(?i)" + _SECRET_WORD)
+ENTROPY_CONTEXT_CHARS = 120
+ENTROPY_THRESHOLD = 4.0
+
+
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    from collections import Counter
+    from math import log2
+
+    n = len(s)
+    return -sum((c / n) * log2(c / n) for c in Counter(s).values())
+
+
+def _redact_high_entropy(text: str, bump) -> str:
+    """Redact long high-entropy runs, but only near secret-ish wording.
+
+    Entropy alone cannot tell an API key from a commit SHA, so the surrounding
+    text has to vouch for it.
+    """
+    out: list[str] = []
+    last = 0
+    for m in HIGH_ENTROPY_RE.finditer(text):
+        blob = m.group(0)
+        if REDACTED in blob or shannon_entropy(blob) < ENTROPY_THRESHOLD:
+            continue
+        context = text[max(0, m.start() - ENTROPY_CONTEXT_CHARS):m.start()]
+        if not SECRET_CONTEXT_RE.search(context):
+            continue
+        out.append(text[last:m.start()])
+        out.append(REDACTED)
+        last = m.end()
+        bump("high-entropy-near-secret")
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
+def redact_text(text: str) -> tuple[str, dict[str, int]]:
+    """Return the text with secrets replaced, plus a count by kind."""
+    found: dict[str, int] = {}
+
+    def bump(kind: str) -> None:
+        found[kind] = found.get(kind, 0) + 1
+
+    def _assignment(m: "re.Match[str]") -> str:
+        value = m.group(4)
+        # "Authorization: Bearer <jwt>" would otherwise redact the word Bearer
+        # and leave the token to a later pattern. Scheme words and placeholders
+        # are not secrets; skipping them keeps the transcript readable.
+        if value.lower() in _NOT_SECRET_VALUES or REDACTED in value:
+            return m.group(0)
+        bump("env-assignment")
+        # Keep the key so the transcript still reads sensibly.
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}{m.group(3)}"
+
+    text = ASSIGNMENT_RE.sub(_assignment, text)
+
+    for kind, pattern, group in SECRET_PATTERNS:
+        def _sub(m: "re.Match[str]", kind=kind, group=group) -> str:
+            bump(kind)
+            if group == 0:
+                return REDACTED
+            whole, base = m.group(0), m.start(0)
+            return whole[: m.start(group) - base] + REDACTED + whole[m.end(group) - base :]
+
+        text = pattern.sub(_sub, text)
+
+    return _redact_high_entropy(text, bump), found
+
+
+def redact_obj(obj: object) -> tuple[object, dict[str, int]]:
+    """Redact string values in a parsed record, leaving structure untouched.
+
+    Walking the parsed object rather than the raw line keeps JSON escaping
+    valid and cannot disturb tool_use/tool_result pairing.
+    """
+    found: dict[str, int] = {}
+
+    def merge(counts: dict[str, int]) -> None:
+        for k, v in counts.items():
+            found[k] = found.get(k, 0) + v
+
+    def walk(node: object) -> object:
+        if isinstance(node, str):
+            new, counts = redact_text(node)
+            merge(counts)
+            return new
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return walk(obj), found
 
 
 def parse_ts(value: object) -> datetime | None:
@@ -174,6 +329,95 @@ def process_file(path: Path, cutoff: datetime, dry_run: bool) -> dict:
     return stats
 
 
+def safe_replace(tmp_path: Path, path: Path, expected: tuple[int, int]) -> bool:
+    """Rename tmp over path only if path has not changed since it was read.
+
+    Trimming avoids the live session entirely, but redaction cannot wait for a
+    session to close -- a secret sitting in an open transcript is read again on
+    every resume. So instead of assuming the file is idle, verify it: if the
+    session appended while we were building the replacement, throw the
+    replacement away and try again next run. Losing a redaction pass is
+    recoverable; losing appended conversation is not.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        return False
+    if (stat.st_size, stat.st_mtime_ns) != expected:
+        tmp_path.unlink(missing_ok=True)
+        return False
+    try:
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        # Windows can refuse the rename while another process holds the file.
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
+def scan_for_secrets(path: Path, start: int) -> dict[str, int]:
+    """Cheap detection pass over bytes appended since the last scan.
+
+    Transcripts only grow, so rescanning from zero on every Stop would mean
+    re-reading hundreds of MB to find nothing. Scan the new tail; a full
+    rewrite only happens when this finds something.
+    """
+    found: dict[str, int] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            if start:
+                fh.seek(start)
+                fh.readline()  # align to a line boundary
+            for line in fh:
+                _, counts = redact_text(line)
+                for k, v in counts.items():
+                    found[k] = found.get(k, 0) + v
+    except OSError:
+        return {}
+    return found
+
+
+def redact_file(path: Path, dry_run: bool) -> dict:
+    """Rewrite the transcript with secrets replaced. Structure is preserved."""
+    stats: dict = {"found": {}, "replaced": False, "lines": 0}
+    try:
+        before = path.stat()
+    except OSError:
+        return stats
+    expected = (before.st_size, before.st_mtime_ns)
+
+    tmp_path = path.with_name(path.name + ".redact-tmp")
+    try:
+        with path.open("rb") as src, tmp_path.open("wb") as dst:
+            for raw in src:
+                stats["lines"] += 1
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    text, counts = redact_text(raw.decode("utf-8", "replace"))
+                    out = text if text.endswith("\n") else text + "\n"
+                    dst.write(out.encode("utf-8"))
+                else:
+                    obj, counts = redact_obj(obj)
+                    out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    dst.write(out.encode("utf-8"))
+                for k, v in counts.items():
+                    stats["found"][k] = stats["found"].get(k, 0) + v
+
+        if dry_run or not stats["found"]:
+            tmp_path.unlink(missing_ok=True)
+            return stats
+        stats["replaced"] = safe_replace(tmp_path, path, expected)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return stats
+
+
 def load_state() -> dict:
     if not STATE_FILE.is_file():
         return {"files": {}}
@@ -198,6 +442,12 @@ def file_key(path: Path) -> str:
 def last_run_at(state: dict, path: Path) -> datetime | None:
     entry = (state.get("files") or {}).get(file_key(path)) or {}
     return parse_ts(entry.get("last_run"))
+
+
+def mark_redact_offset(state: dict, path: Path, offset: int) -> None:
+    """Remember how far the secret scan has read, so it only sees new bytes."""
+    entry = state.setdefault("files", {}).setdefault(file_key(path), {})
+    entry["redact_offset"] = offset
 
 
 def mark_ran(state: dict, path: Path, bytes_after: int) -> None:
@@ -302,6 +552,14 @@ def main() -> int:
         help="Treat a transcript touched within this many minutes as a live session",
     )
     parser.add_argument(
+        "--no-redact", action="store_true", help="Skip the secret-redaction pass"
+    )
+    parser.add_argument(
+        "--redact-only",
+        action="store_true",
+        help="Redact secrets and skip size/interval trimming entirely",
+    )
+    parser.add_argument(
         "--allow-active",
         action="store_true",
         help="Rewrite even a live transcript. Loses whatever that session appends "
@@ -331,6 +589,37 @@ def main() -> int:
     for path in paths:
         if not path.is_file():
             continue
+
+        # Redaction runs on every invocation, including on a live session --
+        # a secret is re-read on every resume, so it should not wait for the
+        # size or interval trigger. safe_replace makes that safe.
+        if not args.no_redact:
+            key = file_key(path)
+            offset = int(state.get("files", {}).get(key, {}).get("redact_offset", 0))
+            size_now = path.stat().st_size
+            if size_now < offset:
+                offset = 0  # file shrank (trimmed elsewhere) -- rescan in full
+            if scan_for_secrets(path, offset):
+                stats = redact_file(path, dry_run=args.dry_run)
+                if stats["found"]:
+                    kinds = ", ".join(f"{k}={v}" for k, v in sorted(stats["found"].items()))
+                    verb = "would redact" if args.dry_run else (
+                        "redacted" if stats["replaced"] else "redaction deferred (file changed)"
+                    )
+                    print(f"{path}: {verb} — {kinds}", file=sys.stderr)
+                    print(
+                        "  These credentials were already sent to the API before this ran. "
+                        "Redaction stops them being re-read; rotate them.",
+                        file=sys.stderr,
+                    )
+                if not args.dry_run and stats["replaced"]:
+                    size_now = path.stat().st_size
+            if not args.dry_run:
+                mark_redact_offset(state, path, size_now)
+
+        if args.redact_only:
+            continue
+
         if not args.allow_active:
             blocked = active_reason(path, live, now, args.active_grace_min)
             if blocked:

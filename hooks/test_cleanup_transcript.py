@@ -236,3 +236,170 @@ def test_line_count_is_preserved(tmp_path):
     kept = [l for l in src.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(kept) == 5
     assert "turn 4" in kept[-1]
+
+
+# --------------------------------------------------------------------------
+# Secret redaction
+#
+# Two failure directions matter equally: missing a secret leaves it to be
+# re-read on every resume, and over-redacting quietly destroys the transcript.
+# --------------------------------------------------------------------------
+
+def tok(prefix: str, body: str) -> str:
+    """Build a token-shaped fixture at runtime.
+
+    These are fabricated, but they are realistic enough that GitHub push
+    protection rejects the push when they appear as literals in the source
+    (it blocked this file's first version on the Slack and Stripe samples).
+    Splitting prefix from body keeps the full shape out of the committed text
+    while the tests still exercise the real patterns.
+    """
+    return prefix + body
+
+
+SECRETS = [
+    ("env-assignment", "AWS_SECRET_ACCESS_KEY=" + tok("wJalrXUtnFEMI", "/K7MDENG/bPxRfiCYEX")),
+    ("env-assignment", 'export API_KEY="s3cr3t-value-not-a-real-key"'),
+    ("env-assignment", "DATABASE_PASSWORD: hunter2hunter2"),
+    ("aws-access-key-id", "key id " + tok("AKIA", "IOSFODNN7EXAMPLE") + " here"),
+    ("github-token", tok("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+    ("slack-token", tok("xoxb", "-123456789012-abcdefghijklmnop")),
+    ("stripe-key", tok("sk_live", "_A1b2C3d4E5f6G7h8I9j0K1l2")),
+    ("google-api-key", tok("AIza", "SyB1c2D3e4F5g6H7i8J9k0L1m2N3o4P5q6R")),
+    ("anthropic-openai-key", tok("sk-ant", "-A1b2C3d4E5f6G7h8I9j0K1l2M3")),
+    ("jwt", tok("eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef")),
+    ("url-credentials", "postgres://admin:hunter2pass@10.0.0.1:5432/prod"),
+]
+
+
+@pytest.mark.parametrize("kind,sample", SECRETS, ids=[s[0] + ":" + s[1][:18] for s in SECRETS])
+def test_secret_is_redacted(kind, sample):
+    out, found = ct.redact_text(sample)
+    assert found, f"{kind} not detected"
+    assert ct.REDACTED in out
+
+
+@pytest.mark.parametrize("kind,sample", SECRETS, ids=[s[0] for s in SECRETS])
+def test_secret_value_does_not_survive(kind, sample):
+    """The point of the exercise: the raw value must be gone."""
+    out, _ = ct.redact_text(sample)
+    secret = sample.split("=")[-1].split(": ")[-1].strip('"')
+    assert secret not in out or secret in ("", ct.REDACTED)
+
+
+def test_pem_private_key_block_is_removed():
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEowIBAAKCAQEAqwertyuiopasdfghjkl\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    out, found = ct.redact_text(pem)
+    assert found.get("pem-private-key") == 1
+    assert "MIIEowIBAAKCAQEA" not in out
+
+
+BENIGN = [
+    "commit 3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a is fine",
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "id 550e8400-e29b-41d4-a716-446655440000",
+    "npm install --save-dev @types/node@20.11.30",
+    "Authorization: Bearer",
+    "the deploy token was rotated last week",
+    "run tests with pytest -q and check coverage",
+]
+
+
+@pytest.mark.parametrize("text", BENIGN)
+def test_benign_content_is_untouched(text):
+    out, found = ct.redact_text(text)
+    assert out == text, f"over-redacted: {found}"
+    assert not found
+
+
+def test_high_entropy_blob_needs_secret_context():
+    blob = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWpr"
+    plain, found_plain = ct.redact_text(f"the payload is {blob}")
+    assert plain.endswith(blob), "redacted a blob with no secret context"
+    assert not found_plain
+
+    near, found_near = ct.redact_text(f"the api_key is {blob}")
+    assert ct.REDACTED in near
+    assert found_near
+
+
+def test_redaction_preserves_json_structure_and_pairing(tmp_path):
+    record = {
+        "type": "user",
+        "timestamp": (NOW - timedelta(days=1)).isoformat(),
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_9",
+                    "content": "GITHUB_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+                }
+            ]
+        },
+    }
+    src = tmp_path / "t.jsonl"
+    src.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    stats = ct.redact_file(src, dry_run=False)
+
+    assert stats["replaced"] is True
+    out = json.loads(src.read_text(encoding="utf-8").strip())
+    block = out["message"]["content"][0]
+    assert block["type"] == "tool_result"
+    assert block["tool_use_id"] == "toolu_9"
+    assert "ghp_" not in block["content"]
+    assert ct.REDACTED in block["content"]
+
+
+def test_clean_transcript_is_not_rewritten(tmp_path):
+    """No secrets means no rewrite — and so no chance of a lost append."""
+    src = tmp_path / "t.jsonl"
+    src.write_text(json.dumps({"type": "user", "message": {"content": "hello"}}) + "\n",
+                   encoding="utf-8")
+    before = src.stat().st_mtime_ns
+
+    stats = ct.redact_file(src, dry_run=False)
+
+    assert stats["found"] == {}
+    assert stats["replaced"] is False
+    assert src.stat().st_mtime_ns == before
+
+
+def test_safe_replace_aborts_when_the_file_changed(tmp_path):
+    """The compare-and-swap that lets redaction touch a live session."""
+    target = tmp_path / "t.jsonl"
+    target.write_text("original\n", encoding="utf-8")
+    stale = (target.stat().st_size, target.stat().st_mtime_ns)
+
+    target.write_text("original\nappended by the live session\n", encoding="utf-8")
+    tmp = tmp_path / "t.jsonl.redact-tmp"
+    tmp.write_text("redacted\n", encoding="utf-8")
+
+    assert ct.safe_replace(tmp, target, stale) is False
+    assert "appended by the live session" in target.read_text(encoding="utf-8")
+    assert not tmp.exists()
+
+
+def test_safe_replace_commits_when_unchanged(tmp_path):
+    target = tmp_path / "t.jsonl"
+    target.write_text("original\n", encoding="utf-8")
+    st = target.stat()
+    tmp = tmp_path / "t.jsonl.redact-tmp"
+    tmp.write_text("redacted\n", encoding="utf-8")
+
+    assert ct.safe_replace(tmp, target, (st.st_size, st.st_mtime_ns)) is True
+    assert target.read_text(encoding="utf-8") == "redacted\n"
+
+
+def test_scan_only_reads_new_bytes(tmp_path):
+    src = tmp_path / "t.jsonl"
+    src.write_text(
+        "GITHUB_TOKEN=" + tok("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8") + "\n",
+        encoding="utf-8",
+    )
+    assert ct.scan_for_secrets(src, 0)
+    assert not ct.scan_for_secrets(src, src.stat().st_size)
