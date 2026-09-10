@@ -2,3 +2,7 @@
 # On Windows checkouts core.autocrlf=true would rewrite them to CRLF, which
 # breaks the shebang line if the script is ever exec'd directly.
 *.sh text eol=lf
+# Same for the node hooks: they are copied verbatim too, and a CRLF after the
+# shebang makes vitest fail to parse run-sh.js.
+packages/cli/hooks/*.js text eol=lf
+hooks/*.js text eol=lf
