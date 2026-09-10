@@ -1,0 +1,4 @@
+# Shell scripts are copied verbatim into ~/.soul/hooks and executed by bash.
+# On Windows checkouts core.autocrlf=true would rewrite them to CRLF, which
+# breaks the shebang line if the script is ever exec'd directly.
+*.sh text eol=lf
